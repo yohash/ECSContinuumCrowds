@@ -1,0 +1,778 @@
+--- PAGE 1 ---
+ECSContinuumCrowds —
+Authoritative Research
+Foundation for a Unity
+DOTS/ECS Continuum Crowds
+Engine
+TL;DR
+A faithful, Burst-ﬁrst ECS port of
+Treuille/Cooper/Popović Continuum Crowds is
+feasible at the 10k-unit / 5-group / 512×512
+baseline on Unity 6 LTS with Entities 1.3.x, Burst
+1.8.x, Collections 2.x; the dominant cost is the per-
+group eikonal solve, so the architecture must
+center on making that solve cheap, parallel-
+across-groups, low-rate, staggered, and double-
+buffered.
+The locked-in design decisions (units-as-entities +
+ﬂat native ﬁeld grids, gather-based density
+stamping, predictive velocity instead of predictive
+discomfort, transient ﬂood-ﬁlled solve domains
+with caching, hybrid FMM/FIM solver, low-rate
+staggered scheduling) are sound and mutually
+--- PAGE 2 ---
+reinforcing; this document elaborates each into
+implementation-ready form and ﬂags every place
+the yohash repo diverges from the paper.
+Recommended build order: (1) dense-grid single-
+group FMM parity harness; (2) gather stamping +
+predictive velocity + anisotropic ﬂoat4 ﬁelds; (3)
+scheduler + staggering + double buffering; (4) FIM
++ hybrid decider; (5) paging only if worlds grow
+past the dense-grid memory budget (512×512 is
+~tens of MB and should stay a single dense grid).
+Key Findings
+Veriﬁed current package versions (July 2026)
+Entities: the 1.3 line is the stable release
+documented by Unity (changelog page titled
+"Changelog | Entities | 1.3.15"); the needle-mirror
+package.json shows the 1.4.x line also exists
+(Collections 2.6.6 changelog references "Updated
+the com.unity.entities dependency to version
+1.4.4"). Target Entities 1.3.14+ (1.3.15 stable),
+with 1.4.x as an upgrade path once validated.
+Burst: 1.8.x is current (1.8.19 pinned by
+Collections 2.5.7; 1.8.23/1.8.25/1.8.27 referenced
+by later Collections releases). Target Burst
+1.8.19+.
+--- PAGE 3 ---
+Collections: 2.x line current; 2.5.7 pairs with
+Entities 1.3.14/Burst 1.8.19; 2.6.6 is the newest
+referenced, pairing with Entities 1.4.4/Burst 1.8.27
+and Mathematics 1.3.2. Target Collections 2.5.7
+(with Entities 1.3.x) or 2.6.x (with 1.4.x).
+Mathematics: 1.3.2. Editor: Unity 6 (6000.x) LTS;
+Entities 1.3 minimum editor is 2022.3.20f1, so
+Unity 6 is well within support.
+Notable API signal: Entities.ForEach and IAspect
+are marked obsolete in the 1.3 line. The Entities
+1.3.15 changelog states: "Entities.ForEach
+marked as obsolete. In order to consolidate our
+API and improve iteration time, we have decided
+to remove Entities.ForEach in a future major
+release of Entities. The two replacement APIs for
+Entities.ForEach are IJobEntity and
+SystemAPI.Query… IAspect marked as obsolete."
+Build entirely on IJobEntity / IJobChunk /
+SystemAPI.Query + ISystem, never
+Entities.ForEach or Aspects.
+The algorithm is dominated by the eikonal
+solve
+The paper is explicit (§3.1): "Solving Equation (5) is
+the slowest aspect of simulation. Thus, we prefer to
+have as few groups as possible." Everything in the
+ECS architecture ﬂows from minimizing and
+parallelizing that solve. The paper's §5 Results report
+--- PAGE 4 ---
+the decoupling that validates the low-rate/staggered
+scheduling decision: "Simulation updates took
+between 2 and 5 frames per second (fps). This
+running time includes a parallel rendering thread
+which calculated 'in-between' frames at 24 fps (12 fps
+for our 10,000 person example)." The contributions
+section adds the scale claim: "At coarse
+discretizations we can simulate crowds of over ten
+thousand people at several frames a second, while at
+ﬁne discretizations we can simulate high resolution
+dynamics for several thousand people at real-time
+frame rates."
+The repo/paper divergences are real and must
+be encoded deliberately
+The community implementations that mirror the
+yohash conventions (Dani Phye's "Computational
+Bubblegum" series; howtorts) conﬁrm two systematic
+divergences the document must carry:
+(a) Gradient representation — the paper stores
+anisotropic gradients as 4 face components per cell
+(two x, two y) in a MAC arrangement; Blogger the
+repo/blog lineage averages x-pairs and y-pairs into a
+single central-difference normalized gradient per cell.
+Dani Phye states verbatim: "In the paper, the author
+actually uses 4 components per node, two x for left
+and right, and two y for up and down. The method I
+described averages the x values and y values together,
+--- PAGE 5 ---
+and though it's a little different than the paper, I prefer
+it. It makes for cleaner implementations, and in
+practice is basically identical."
+(b) Root selection — the paper takes the larger
+quadratic root, while the repo blends the two roots
+with a weighted mean (maxWeight/minWeight).
+Details
+A. Faithful algorithm speciﬁcation
+(implementation-ready, repo conventions)
+Coordinate & direction conventions. All anisotropic
+ﬁelds (speed f, cost C) are stored as one float4 per
+cell, lanes packed ENSW = (East θ=0°, North θ=90°,
+West θ=180°, South θ=270°), matching the paper's
+"four ﬂoats per cell corresponding to θ =
+{0°,90°,180°,270°}". Scalar ﬁelds (ρ, discomfort g,
+potential φ) are one ﬂoat per cell at cell center;
+average velocity v̄ is a float2 per cell. The gradient
+of height ∇ h, gradient of potential ∇ φ, and velocity v
+are conceptually face quantities (MAC-style) in the
+paper; the shipping implementation stores ∇ φ as a
+per-cell float2 (central difference), see the eikonal
+note below.
+Four hypotheses →  cost ﬁeld. Units seek geographic
+goal G ⊆ R². They move at max speed x˙ = f(x,θ)·nθ
+where nθ=[cosθ,sinθ]. A discomfort ﬁeld g encodes
+--- PAGE 6 ---
+geographic preference. Path choice minimizes
+α·(length) + β·(time) + γ·(discomfort per unit time),
+washington which after ds = f·dt collapses to the unit
+cost ﬁeld (paper eq. 4):
+C = (α·f + β + γ·g) / f, evaluated per direction.
+Repo constant names: C_alpha, C_beta, C_gamma.
+In the repo, g is clamped to [0,1] before use; a
+direction whose speed f ≤ 0 or which enters an
+invalid/blocked cell gets inﬁnite cost (that ENSW lane
+set to +∞). The cost is evaluated one cell into the
+direction of travel — i.e. for the E lane of cell M, use ρ,
+g, v̄ sampled at the east-neighbor cell ("we evaluate
+the speed and discomfort at the cell into which the
+person would be moving"). washington
+Density splat (paper) vs footprint (repo). Paper splat
+for a person at fractional offset [Δx,Δy] from the lower
+cell center, exponent λ:
+ρ_A (this cell) = min(1−Δx, 1−Δy)^λ
+ρ_B = min(Δx, 1−Δy)^λ
+ρ_C = min(Δx, Δy)^λ
+ρ_D = min(1−Δx, Δy)^λ
+with ρ̄ = (1/2)^λ, washington so λ = log_{1/2}(ρ̄); ρ̄≈0.7
+is a common value. This guarantees each person
+contributes ≥ ρ̄ to its own cell and ≤ ρ̄ to neighbors
+(the discrete analog of the radius-r disc), washington
+so a unit never self-obstructs when speed/density are
+--- PAGE 7 ---
+sampled at the r·nθ offset. Average velocity: v̄ =
+Σ(ρ_i·x˙_i)/ρ (paper eq. 7). The repo generalizes the
+per-unit splat into an IContinuumUnit.Footprint
+float[,] with mass scaling — a repo extension not
+in the paper — allowing non-point footprints (e.g.
+large units). The ECS port should implement the
+paper's λ-splat as the default and expose an optional
+footprint kernel matching the repo.
+Speed ﬁeld — three density regimes (paper eqs. 8–
+10).
+Topographical (ρ ≤ f_rhoMin): f_T(x,θ) = f_max +
+(( ∇ h·nθ − s_min)/(s_max − s_min))·(f_min −
+f_max). Repo constants
+f_slopeMin/f_slopeMax,
+f_speedMin/f_speedMax. (Downhill →  faster,
+uphill →  slower; clamped to [f_min,f_max].)
+Flow (ρ ≥ f_rhoMax): f_v̄(x,θ) = v̄(x + r·nθ)·nθ. Per
+Treuille et al. §3.2 (eq. 9): "the ﬂow speed is
+clamped to be nonnegative, implying that the
+crowd can slow people down, but never carry
+them backwards." The r·nθ offset (repo
+xGlobalInto/yGlobalInto) is the crux of lane
+formation.
+Medium (f_rhoMin < ρ < f_rhoMax): linear
+interpolation f = f_T + ((ρ(x+r·nθ) −
+f_rhoMin)/(f_rhoMax − f_rhoMin))·(f_v̄ − f_T).
+--- PAGE 8 ---
+Eikonal equation & FMM update (paper eqs. 5, 11).
+φ=0 in the goal, φ solves ‖ ∇ φ‖ = C. FMM sets
+KNOWN/CANDIDATE/UNKNOWN, uses a heap, O(N
+log N). For cell M, choose upwind neighbors m_x =
+argmin_{W,E}{φ_i + C_{M → i}}, m_y = argmin_{N,S}{φ_i
++ C_{M → i}}, washington then solve for φ_M in:
+(φ_M − φ_{mx})² / C_{M → mx} + (φ_M − φ_{my})² /
+C_{M → my} = 1
+dropping a dimension if a neighbor pair is inﬁnite.
+washingtonRepo divergence (root selection): the
+paper takes the larger root; the repo computes both
+roots and returns a weighted average using
+maxWeight/minWeight (documented defaults 2.5 /
+1.0 — verify against source), with code commentary
+that a pure-max choice biases ﬂow toward diagonals
+and that the weighted mean is the best compromise
+(with min / mean / geometric-mean alternatives left
+commented). Decision: ship the repo's weighted-
+mean blend (behind a solver ﬂag) to reproduce
+yohash behavior, and keep the pure-larger-root as the
+reference/validation mode.
+Velocity derivation (paper eq. 6). v = −f· ∇ φ/‖ ∇ φ‖, with
+f evaluated in the direction of motion washington (per
+ENSW lane chosen by the sign of ∇ φ components).
+Repo divergence (gradient): the paper differences φ
+in the upwind direction; the repo takes a central-
+difference ∇ φ (averaging the two x faces and two y
+--- PAGE 9 ---
+faces into one per-cell float2) with explicit special-
+casing when a neighbor is +∞ or off-grid (fall back to
+one-sided difference / obstacle handling). Decision:
+implement the repo's central-difference normalized
+gradient as the shipping path (smoother, cleaner,
+matches yohash output), document the paper's
+upwind differencing as the reference deﬁnition, and
+expose it behind a toggle for obstacle-adjacent
+consistency testing. Tradeoff: upwind is more
+consistent with the causality of the eikonal solution
+near obstacles/walls; central difference is smoother
+in open regions but can smear direction right at
+obstacle boundaries.
+Predictive velocity, not predictive discomfort (repo,
+rejecting paper §3.3). The paper deposits discomfort
+ahead of moving units ("we advance each person's
+position by their velocity for several timesteps
+depositing to the discomfort ﬁeld"). washington This
+is rejected: a unit sees its own projected discomfort
+ahead and swerves to avoid itself →  oscillation.
+Instead, extrapolate each unit's velocity/footprint
+contribution forward in the density/velocity stamping
+pass (repo constants v_predictiveSeconds,
+v_scaleMax, v_scaleMin,
+v_dynamicFootprintThreshold), so the ﬂow ﬁeld v̄
+that drives the ﬂow-speed term already reﬂects near-
+future crowd motion. This preserves lane/fast-lane
+formation without self-avoidance oscillation.
+--- PAGE 10 ---
+Simulation loop (paper §4). Per tick: (1) splat crowd
+→  ρ, v̄ (global); per group: (2) build unit cost ﬁeld C;
+(3) solve φ and ∇ φ; (4) advect units; (5) enforce
+pairwise minimum distance (spatial-hash binned,
+symmetric pushes — the paper notes minimum-
+distance enforcement "has linear time complexity if
+the crowd is ﬁrst 'binned' into a high-resolution
+neighbor grid").
+B. ECS data architecture
+Design axiom (locked): grid cells are NOT entities.
+Units are entities; groups/solve-requests are entities;
+all ﬁeld data lives in ﬂat native containers operated on
+by Burst jobs. This avoids per-cell chunk overhead
+and gives the neighbor-relative access the algorithm
+needs.
+Unit entity components (all IComponentData,
+unmanaged, Burst-friendly):
+LocalTransform (position; Entities.Transforms).
+CCVelocity { float2 value } (current velocity,
+used for splat momentum and predictive velocity).
+CCAgent { float radius; float mass; int
+groupId } (footprint params + group
+membership).
+Optional CCFootprintRef (BlobAssetReference
+to a footprint kernel) for non-point units.
+--- PAGE 11 ---
+Enableable tag CCActive to cheaply
+include/exclude without structural change.
+Group / solve-request entity components:
+CCGroup { int groupId; float2 goalMin,
+goalMax (or goal cell list ref); float
+alpha,beta,gamma; ... }.
+CCSolveState { enum {Idle, Flooding,
+Solving, Ready}; int frameScheduled; token
+} (JobHandle stored in system state, not
+component).
+CCDomainCache (see §E) — references to pooled
+native buffers for the cached ﬂood-ﬁlled domain.
+Double-buffered ﬁeld references (see below).
+Global ﬁeld storage — SoA NativeArrays, one per
+ﬁeld (recommended over packed AoS structs):
+separate NativeArray<float> for ρ,
+NativeArray<float2> v̄, NativeArray<float> g,
+NativeArray<float2> ∇ h (precomputed from
+height), plus static walkability
+NativeArray<byte>/bitmask. Anisotropic per-group
+working ﬁelds (f, C) are NativeArray<float4>
+(ENSW packed →  aligns naturally with SIMD lanes). φ
+is NativeArray<float>; ∇ φ is
+NativeArray<float2>. Rationale for SoA: the
+stamping and cost passes touch different subsets of
+ﬁelds; SoA maximizes cache-line utilization and lets
+Burst auto-vectorize each pass. ﬂoat4 packing of the
+--- PAGE 12 ---
+anisotropic ﬁelds is the single biggest SIMD win — all
+four directions computed in one vector op.
+Memory footprint at 512×512 = 262,144 cells:
+Global scalar ﬂoat ﬁeld: 262,144 × 4 B = 1.0 MiB
+each (ρ, g, φ per group).
+ﬂoat2 ﬁeld (v̄, ∇ h, ∇ φ): 2.0 MiB each.
+ﬂoat4 anisotropic ﬁeld (f, C): 4.0 MiB each.
+byte walkability: 0.25 MiB.
+Global shared ﬁelds (ρ, v̄, g, ∇ h, walkability) ≈ 1 + 2 + 1
++ 2 + 0.25 ≈ 6.3 MiB, allocated Persistent. Per-group
+transient working set (C ﬂoat4, f ﬂoat4, φ ﬂoat, ∇ φ
+ﬂoat2, plus FMM heap/status) ≈ 4 + 4 + 1 + 2 + ~2 ≈
+~13 MiB per concurrent full-grid solve, but solve
+domains are usually a fraction of the full grid (ﬂood-
+ﬁlled), so real per-solve footprint is far smaller.
+Double-buffering the published per-group velocity ﬁeld
+(ﬂoat2, 2 MiB) doubles only that ﬁeld: ~4 MiB per
+group for the sampled output. Total working memory
+for 5 concurrent groups is comfortably in the tens of
+MiB — a single dense grid is strongly recommended
+at 512×512; paging is unnecessary until worlds
+exceed ~2048² or become very sparse.
+Spatial hash (boids-style, Collections):
+NativeParallelMultiHashMap<int, int> mapping
+cell-hash →  unit index (or entity), rebuilt each
+stamping tick. Bucket key = ﬂat grid cell index (or a
+--- PAGE 13 ---
+coarser bin of side ≈ 2r). The boids sample and
+community DOTS ports (hecomi's "Unity 6 + ECS 1.3
+Boids", andrew-raphael-lukasik's spatial-hash gist
+updated for Entities 1.3.14) are the reference
+patterns. Use .AsParallelWriter() to ﬁll it from an
+IJobEntity.
+Double-buffered velocity ﬁelds: each group keeps
+two NativeArray<float2> velocity buffers
+(front/back) plus an atomic/int "published index".
+Solves write into the back buffer; on completion the
+index ﬂips. The per-frame advection job always
+samples the currently published (front) buffer, so an
+in-progress solve never tears the ﬁeld being read.
+C. System / job pipeline (frame graph)
+All systems are ISystem + [BurstCompile]
+(ISystem OnUpdate can itself be Burst-compiled;
+community proﬁling reports ~0.01 ms vs ~0.05 ms
+for SystemBase per update — use ISystem
+throughout). Group ordering via [UpdateInGroup],
+[UpdateBefore/After].
+Per-frame group (runs every frame):
+1. SpatialHashRebuildSystem — clear + parallel-ﬁll
+NativeParallelMultiHashMap of units. (Every
+frame, because advection moves units.)
+2. AdvectionSystem — IJobEntity over units:
+bilinear-sample the published group velocity ﬁeld
+--- PAGE 14 ---
+at unit position, Euler-integrate
+LocalTransform.Position, update CCVelocity.
+Reads front buffer only →  no dependency on in-
+ﬂight solves.
+3. MinDistanceSystem — spatial-hash neighbor
+query, symmetric pairwise pushes (parallel;
+matches paper §4.5). Structured to avoid write
+races: gather-style per-unit accumulation or
+double-buffered positions.
+Scheduled solve tick (ﬁxed timestep, e.g. 10 Hz, in a
+ﬁxed-rate ComponentSystemGroup with its own
+system-group rewindable allocator):
+4. StampingSystem (pass 1, GATHER) — see §D.
+Produces global ρ, v̄ (with predictive velocity
+extrapolation).
+5. SolveSchedulerSystem — decides which groups
+solve this tick (staggering), triggers ﬂood-ﬁll/cache
+validation, schedules eikonal jobs, records
+JobHandles in system state; does NOT block.
+6. SolveCompletionSystem — polls handles from
+prior ticks (JobHandle.IsCompleted), and when
+done, ﬂips the group's double-buffer published index.
+Long solves thus span multiple frames without a
+main-thread stall.
+Sync points / EntityCommandBuffers: structural
+changes (spawning/destroying groups,
+adding/removing tags) go through
+BeginSimulationEntityCommandBufferSystem /
+--- PAGE 15 ---
+EndSimulationEntityCommandBufferSystem. Field
+jobs use plain native containers and JobHandle
+chains — no structural changes inside the hot solve
+path, so the only unavoidable sync points are (a) the
+ECB playback for group lifecycle and (b) the
+completion barrier when a solve result is consumed.
+Enableable CCActive avoids structural churn for
+activate/deactivate.
+Staggered scheduler detail: maintain a round-robin
+cursor over groups. Per solve tick, schedule at most
+⌈ numGroups / staggerFrames ⌉  solves so the 5 groups
+spread across the tick budget; each group re-solves
+every N ticks (its own rate). FMM solves for different
+groups are independent Burst IJobs scheduled in
+parallel (they read shared stamped ﬁelds read-only
+and write private φ), so cross-group parallelism is
+free. A group's solve JobHandle is chained:
+ﬂoodﬁll/cache →  costﬁeld build →  eikonal →
+gradient/velocity →  publish. Completion is polled,
+never .Complete()-blocked on the main thread
+except at a hard deadline (e.g. if a solve overruns its
+staleness budget).
+Allocator strategy: global persistent ﬁelds →
+Allocator.Persistent. Per-tick scratch that lives
+one tick →  world update allocator (double rewindable,
+spans two frames, no manual free) or the system-
+group allocator for the ﬁxed-rate solve group. Solve-
+domain lists that must survive a multi-frame solve →
+--- PAGE 16 ---
+Allocator.TempJob (must free within 4 frames — ﬁts
+multi-frame solves) or Persistent pooled buffers
+reused across solves. Prefer pooled Persistent
+buffers keyed by solve slot for the eikonal working
+set to eliminate allocation in steady state.
+D. Stamping pass — GATHER (recommended
+default)
+Three candidate strategies:
+Scatter with atomics: each unit atomically adds
+ρ/momentum to its 4 cells. Simple but atomic
+contention on hot cells kills throughput and ﬂoat
+atomics are awkward/nondeterministic.
+Scatter with per-thread buffers: each worker
+accumulates into a private grid, then reduce. No
+contention but O(threads × gridSize) memory
+(512² × ﬂoat × 16 threads ≈ 16 MiB per ﬁeld) and a
+reduction pass.
+GATHER (chosen): build the unit spatial hash,
+then a parallel job over active cells where each
+cell pulls ρ and ρ·v̄ from units in its own +
+neighboring buckets. No write races, fully Burst-
+vectorizable, deterministic.
+Gather implementation speciﬁcs:
+Bucket sizing: bin side ≈ splat radius r (≈ one cell
+for point units; ≈ unit radius for footprints). One
+--- PAGE 17 ---
+cell per bucket is simplest given the λ-splat only
+touches a 2×2 cell block; then each cell gathers
+from the 3×3 neighborhood of buckets to catch all
+contributors.
+Query radius: for the λ-splat, a unit affects only
+the 2×2 block around its fractional position, so a
+target cell receives contributions from units in the
+(up to) 2×2 buckets adjacent to it — gather a 3×3
+bucket window to be safe with footprints.
+Active-cell determination: don't iterate all 262k
+cells. Derive the set of occupied buckets from the
+hash (unique keys), dilate by one ring, and iterate
+only those cells via an IJobParallelFor over a
+compacted active-cell list. This makes stamping
+scale with crowd size, not grid size — critical for
+sparse worlds.
+Predictive velocity is applied here: when a unit
+contributes momentum, also deposit an
+extrapolated contribution at position +
+v·v_predictiveSeconds (scaled by
+v_scaleMin..v_scaleMax, gated by
+v_dynamicFootprintThreshold), so v̄ leads the
+crowd.
+E. Solve domains — transient, terrain-aware,
+cached
+Derivation (locked): per solve, ﬂood-ﬁll (BFS) over the
+global walkability grid outward from the goal + the
+--- PAGE 18 ---
+group's unit extents, bounded by a cost horizon or
+padded region. Output: a NativeList<int> of global
+cell indices + a compact index remap (global ↔ local).
+Solve runs on the local domain only; domains from
+different groups may overlap (they read shared
+stamped ﬁelds, write private φ). This eliminates tile-
+edge discontinuities and the lengthwise-split-terrain
+artifacts of naive square tiles.
+Caching scheme (concrete recommendation):
+Store per solve-request entity: the domain cell list,
+its bounding box, the goal it was built for, and the
+group centroid/extent at build time (in
+CCDomainCache referencing pooled native
+buffers).
+Invalidation triggers: (a) goal changed; (b) group
+centroid or extent moved beyond a hysteresis
+threshold (e.g. > padding/2 in cells); (c) walkability
+edit whose dirty-rect intersects the domain bbox
+(maintain a global "walkability version" int + per-
+edit dirty rectangles).
+Incremental expansion vs full re-derivation: if
+units drift outward but goal/walkability
+unchanged, expand the domain by BFS-continuing
+from the current frontier to cover the new extent
+(cheap) rather than rebuilding. Full re-derivation
+only on goal change or topology edit.
+--- PAGE 19 ---
+Hysteresis/padding: build domains with a
+padding ring (e.g. +8–16 cells beyond the tightest
+bound) so small per-frame movements stay inside
+the cached domain and don't trigger invalidation.
+This is the single most important knob for
+amortizing ﬂood-ﬁll cost.
+F. Eikonal solver — deep dive & hybrid decider
+FMM in Burst. Serial, priority-queue driven, O(N log N).
+Native priority queue options, in preference order:
+Dial's algorithm / bucket (untidy) queue: because
+C is bounded (ﬁnite f_min/f_max, α/β/γ, g ∈ [0,1]),
+the potential increments are bounded, so a
+bucketed monotone queue gives near-O(N) with
+O(1) push/pop. The untidy priority queue was
+introduced by Yatziv, Bartesaghi & Sapiro (2006, J.
+Comput. Phys. 212:393–399); Rasch & Satzger
+("Remarks on the O(N) Implementation of the Fast
+Marching Method," arXiv:cs/0703082; IMA J.
+Numerical Analysis 29(3):806–813, 2009) note it
+reduces overall complexity "to O(N) at the price of
+a small error," and that "the choice of an accuracy
+level that is independent of the speed function F
+results in the complexity bound
+O(F_max/F_min·N)." So bucket resolution must be
+chosen from the actual cost range. This is the
+recommended FMM queue for speed.
+--- PAGE 20 ---
+Binary heap on NativeList<T>: exact ordering,
+O(N log N), simplest to get correct ﬁrst. Ship this
+in Phase 1, swap to buckets in Phase 4 if proﬁling
+warrants.
+Simpliﬁed FMM (SFMM): allow duplicate stale
+entries in the queue, skip decrease-key, ignore
+stale pops — lower constant than decrease-key
+heaps, easy in a native array.
+Avoid the managed yohash.priorityqueue
+dependency — reimplement as a Burst-compatible
+struct.
+FIM (Fast Iterative Method, Jeong & Whitaker 2008,
+SIAM J. Sci. Comput. 30(5):2512–2534, DOI
+10.1137/060670298). Per its abstract, FIM "manages
+the list of active nodes and iteratively updates the
+solutions on those nodes until they converge… has
+suboptimal worst-case performance but, in practice…
+runs faster than guaranteed-optimal alternatives…
+uses only local, synchronous updates and therefore
+has better cache coherency, is simple to implement,
+and scales eﬃciently on parallel architectures." A
+node is removed from the active list when its value
+stops changing (converges), and its neighbors are re-
+added if they change. Crucially, the follow-up GPU-FIM
+literature (arXiv:2106.15869) credits Jeong &
+Whitaker with the observation that "most points
+require only a single update to converge" — which is
+why the active-list management needs no ordered
+--- PAGE 21 ---
+data structure or special update sequence, and why
+FIM parallelizes where FMM's heap does not.
+Block-FIM / parallel FIM for CPU (Burst threading).
+The scalable variants (block-based FIM; MG-FIM
+adaptive domain decomposition; the block-based
+FMM of arXiv:1811.00009 reporting "sustained super-
+linear parallel speedups") ResearchGate partition the
+domain into blocks; a block is "active" if any of its
+nodes may still change. Each iteration: (1) a
+marching/update step relaxes all active blocks in
+parallel (IJobParallelFor over the active block list),
+each block Gauss-Seidel/Jacobi-sweeping its interior;
+(2) a synchronized exchange step propagates block-
+boundary values and recomputes which blocks stay
+active. Load imbalance is reduced by many small
+blocks and by activation masks that skip idle blocks
+(cache-eﬃcient parallel eikonal solvers report 85–
+95% parallel eﬃciency on multicore CPUs). Springer
+On CPU-Burst, implement blocks as e.g. 16×16 or
+32×32 tiles, an active-block NativeList<int>, and
+per-iteration parallel sweeps with an atomic/ﬂag
+reduction to rebuild the active set. Expect work
+overhead vs FMM (FIM does more total node updates
+because it re-relaxes) but wall-clock wins when a
+single solve is large enough to saturate multiple
+worker threads.
+Hybrid decider.
+--- PAGE 22 ---
+FMM (serial, bucket-queue) per solve, many
+solves in parallel across groups for
+small/medium domains — this is the default
+because with 5 groups the natural parallelism is
+across solves, keeping each solve a cheap serial
+job.
+FIM/block-FIM (parallel within one solve) only
+when a single domain is large enough that going
+wide across worker threads beats running it
+serially — e.g. one giant group covering most of a
+large map, or fewer groups than cores.
+Crossover threshold methodology (benchmark-
+driven): measure, on target hardware, FMM-serial
+wall-time and block-FIM wall-time as a function of
+domain cell count N and available idle worker
+threads. The crossover N* is where block-FIM
+wall-time (which falls with more threads but
+carries the re-relaxation overhead factor) drops
+below FMM-serial. Initial estimate for the
+512×512 baseline: with 5 concurrent groups on
+an 8–16 thread CPU, cross-group FMM
+parallelism already ﬁlls the cores, so FMM should
+win for domains up to roughly the full grid; set an
+initial FIM crossover around N ≈ 30,000–60,000
+cells (~one quarter to one half of the 512² grid)
+AND idle-thread-count ≥ 4*, then tune from Burst-
+proﬁled numbers. Treat this as a hypothesis to be
+measured, not a ﬁxed constant.
+--- PAGE 23 ---
+G. Performance engineering
+Hot paths: (1) eikonal solve (dominant); (2) cost-
+ﬁeld build (ﬂoat4 ENSW per cell — heavily
+vectorizable); (3) stamping gather; (4) per-frame
+advection over 10k units (cheap, bilinear sample).
+Vectorization: pack anisotropic f and C as
+float4 (ENSW) so one Burst vector op does all
+four directions; keep ﬁelds SoA; ensure 16-byte
+alignment (NativeArray Temp is 64-byte aligned by
+default). Use Unity.Mathematics
+float4/math.select to keep branches
+vectorizable; avoid data-dependent branches in
+inner loops (they defeat auto-vectorization, as the
+Entities enableable-component docs warn —
+mixed enabled/disabled chunks "create branches
+and interfere with Burst's ability to vectorize
+code").
+Memory bandwidth (512²): a full pass over one
+ﬂoat ﬁeld is ~1 MiB read + write; cost-ﬁeld build
+touches ρ, v̄, g, ∇ h and writes C,f (~13 MiB
+traﬃc/pass). At 10 Hz × 5 groups this is well
+within modern CPU bandwidth; the solve's random
+heap access, not bandwidth, is the bottleneck —
+another argument for bucket queues and block-
+FIM cache locality.
+Chunk iteration for 10k units: 10k units in a
+handful of archetypes = tens of chunks;
+IJobEntity.ScheduleParallel over them is
+--- PAGE 24 ---
+trivial. Keep unit component set minimal and
+stable to avoid archetype fragmentation.
+Avoid sync points: never call .Complete() in the
+solve path; use IsCompleted polling + double
+buffering. Batch structural changes into one ECB
+playback per frame.
+Allocators: Persistent for global + pooled solve
+buffers; world-update/system-group rewindable
+for per-tick scratch; TempJob only for multi-frame
+domain lists.
+Proﬁling methodology: Unity Proﬁler with custom
+ProfilerMarkers around stamping / ﬂoodﬁll /
+costﬁeld / eikonal / advection; Burst Inspector to
+conﬁrm the cost-ﬁeld and FMM update loops
+vectorize (check for SIMD instructions, no bailouts
+to managed calls); Timeline view to conﬁrm cross-
+group solves overlap and don't collapse onto the
+main thread; enable Burst safety checks off for
+perf runs, on for correctness runs.
+Risks & open questions
+Repo constant values are cited from the task
+brief, not conﬁrmed from source (the yohash
+.cs ﬁles aren't web-indexed and GitHub tree
+listings are robots-blocked; blob pages exist but
+individual ﬁlenames weren't resolvable via
+search). maxWeight/minWeight (2.5/1.0), the
+f_rho/f_slope/f_speed ranges,
+--- PAGE 25 ---
+C_alpha/beta/gamma, λ, and the predictive-
+velocity constants must be read directly from
+Assets/ContinuumCrowds/*.cs (open blob
+pages in-editor or clone the repo) before locking
+spec numbers.
+Bucket-queue error vs F_max/F_min: if cost
+dynamic range is large (steep discomfort + slow
+ﬂow), untidy-queue quantization error grows (the
+O(F_max/F_min·N) bound); validate against exact-
+heap FMM and size buckets accordingly.
+FIM anisotropy: the CC cost is anisotropic
+(direction-dependent C); standard FIM/Godunov
+updates are usually derived for isotropic F. The
+per-direction C_{M → i} structure of eq. 11 must be
+preserved inside the FIM local solver — conﬁrm
+the block-FIM local update uses the same upwind-
+neighbor-with-directional-cost quadratic, not an
+isotropic simpliﬁcation.
+Determinism: parallel FIM and ﬂoat atomics can
+produce run-to-run variation; if determinism is
+required (replays/netcode), prefer the gather
+stamping (deterministic), serial FMM, and
+deterministic reductions.
+Recommendations
+Phased build plan (each phase gated by a validation
+milestone):
+--- PAGE 26 ---
+1. Phase 1 — Dense grid, single group, FMM
+(binary-heap). Implement global SoA ﬁelds, λ-
+splat stamping (scatter-simple ok here), cost ﬁeld
+(ﬂoat4 ENSW), FMM with NativeList binary
+heap, advection, min-distance. Validate:
+reproduce a single-group ﬂow around obstacles;
+build a parity harness comparing φ and unit
+trajectories against the yohash implementation on
+identical inputs (same seed, grid, constants).
+Threshold to proceed: φ RMS error vs reference
+below a small tolerance and qualitatively identical
+paths.
+2. Phase 2 — Gather stamping + predictive velocity
++ full anisotropy. Replace scatter with hash-based
+gather over active cells; add predictive velocity
+extrapolation; ﬁnalize ENSW ﬂoat4 cost/speed
+and central-difference gradient (with upwind
+toggle). Validate: reproduce lane formation (two
+groups passing form lanes) and conﬁrm
+predictive velocity produces fast/slow lanes
+without oscillation.
+3. Phase 3 — Scheduler + staggering + double
+buffering. Fixed-rate solve group at 10 Hz, round-
+robin staggered group solves, JobHandle
+chaining, IsCompleted polling, double-buffered
+published velocity ﬁelds, per-frame advection
+decoupled from solves. Validate: 5 groups solving
+at 10 Hz while units advect at 60 fps with no
+--- PAGE 27 ---
+main-thread stalls (Proﬁler Timeline shows
+overlapped solves); reproduce the 4-group
+crossing vortex.
+4. Phase 4 — FIM + hybrid decider + bucket-queue
+FMM. Add block-FIM parallel solver and
+bucket/untidy-queue FMM; implement the
+size/thread-based decider; benchmark to ﬁx the
+crossover N*. Validate: large single-group solve
+faster via block-FIM than serial FMM; small-group
+workloads unchanged; measured crossover
+documented.
+5. Phase 5 — Paging (only if needed). Implement
+ﬁxed-size pages in a hash map, allocated on
+demand, invisible to the algorithm. Trigger to
+build this: only when target worlds exceed the
+dense-grid memory budget — concretely, grid >
+~1024²–2048² or high sparsity. At 512×512 (≈6
+MiB global + tens of MiB working set) do not build
+paging.
+Benchmarks/thresholds that change the plan:
+If a single group's FMM solve at 512² exceeds the
+solve-tick budget (100 ms at 10 Hz) on target
+hardware →  raise staggering/lower solve rate, or
+accelerate FMM (bucket queue) before adding
+FIM.
+If 5 concurrent FMM solves don't ﬁll available
+cores (few groups, many cores) →  lower the FIM
+--- PAGE 28 ---
+crossover N* so single solves go wide.
+If memory working set approaches budget as
+groups scale (e.g. > 50 groups) →  introduce solve-
+buffer pooling limits and/or paging.
+If determinism failures appear in replays →  drop
+ﬂoat atomics and parallel-FIM nondeterminism in
+favor of serial FMM + deterministic reductions.
+Caveats
+Package version numbers are as documented by
+Unity/needle-mirror changelogs as of July 2026;
+pin exact versions in manifest.json and re-verify
+after any editor upgrade, since Entities 1.4.x is
+emerging alongside 1.3.x.
+All yohash repo constant names/values and the
+exact root-blend and gradient code are
+reconstructed from the task brief plus
+corroborating community implementations
+(Computational Bubblegum, howtorts, Sarah
+Noonan) that share the same lineage and
+conventions; the precise numeric defaults and
+code comments must be read from the actual
+Assets/ContinuumCrowds/*.cs before freezing
+the spec.
+The FIM crossover estimate (N* ≈ 30k–60k cells,
+≥4 idle threads) is an engineering hypothesis
+derived from the algorithmic literature, not a
+--- PAGE 29 ---
+measured value on this project's target hardware;
+it must be replaced with Burst-proﬁled numbers in
+Phase 4.
+The paper's own performance (2–5 fps sim, 10k
+people on coarse grids, 2006-era hardware)
+establishes the low-rate decoupling principle, not
+a modern performance target — expect large
+headroom on Unity 6 + Burst but validate against
+the actual solve cost at 512².
