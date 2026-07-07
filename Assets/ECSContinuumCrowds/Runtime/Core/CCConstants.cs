@@ -42,6 +42,15 @@ namespace Yohash.ECSContinuumCrowds
     public float v_scaleMax;
     /// <summary>Predictive ghost-stamp scale at t=v_predictiveSeconds (default 0.25).</summary>
     public float v_scaleMin;
+    /// <summary>
+    /// Cap (in cells) on the predictive extrapolation distance (spec §6.3,
+    /// spec-added, default 8). Without it, R_max = footprint +
+    /// v_predictiveSeconds·f_speedMax/CellSize would be 20+ cells at default
+    /// speeds and the stamping-hash buckets would grow unboundedly; the spec
+    /// mandates clamping the extrapolation distance instead. Also bounds the
+    /// scatter-reference ghost-chain length (CCStampOps.MaxGhosts).
+    /// </summary>
+    public float v_predictiveDistanceCapCells;
 
     // --- Speed field ---
     public float f_slopeMax;   // default  1.0
@@ -88,6 +97,7 @@ namespace Yohash.ECSContinuumCrowds
       v_predictiveSeconds = 1f,
       v_scaleMax = 0.3f,
       v_scaleMin = 0.25f,
+      v_predictiveDistanceCapCells = 8f,
       f_slopeMax = 1f,
       f_slopeMin = -1f,
       f_rhoMax = 0.8f,

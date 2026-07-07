@@ -45,7 +45,8 @@ namespace Yohash.ECSContinuumCrowds.Tests
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCSolveTickSystem>());
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCGroupInitSystem>());
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCUnitSpawnSystem>());
-      group.AddSystemToUpdateList(world.GetOrCreateSystem<CCScatterStampingSystem>());
+      group.AddSystemToUpdateList(world.GetOrCreateSystem<CCSpatialHashSystem>());
+      group.AddSystemToUpdateList(world.GetOrCreateSystem<CCStampingSystem>());
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCFieldSystem>());
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCEikonalSystem>());
       group.AddSystemToUpdateList(world.GetOrCreateSystem<CCVelocityDerivationSystem>());

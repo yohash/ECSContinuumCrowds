@@ -14,6 +14,8 @@ namespace Yohash.ECSContinuumCrowds.Tests
       Assert.AreEqual(1f, c.v_predictiveSeconds);
       Assert.AreEqual(0.3f, c.v_scaleMax);
       Assert.AreEqual(0.25f, c.v_scaleMin);
+      // spec-added (§6.3): predictive extrapolation cap, not a repo constant
+      Assert.AreEqual(8f, c.v_predictiveDistanceCapCells);
       Assert.AreEqual(1f, c.f_slopeMax);
       Assert.AreEqual(-1f, c.f_slopeMin);
       Assert.AreEqual(0.8f, c.f_rhoMax);

@@ -13,7 +13,7 @@ namespace Yohash.ECSContinuumCrowds
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
   [UpdateAfter(typeof(CCGroupInitSystem))]
-  [UpdateBefore(typeof(CCScatterStampingSystem))]
+  [UpdateBefore(typeof(CCSpatialHashSystem))]
   public partial struct CCUnitSpawnSystem : ISystem
   {
     public void OnUpdate(ref SystemState state)
