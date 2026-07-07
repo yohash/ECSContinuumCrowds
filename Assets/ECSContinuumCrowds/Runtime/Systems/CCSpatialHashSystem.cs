@@ -16,7 +16,7 @@ namespace Yohash.ECSContinuumCrowds
   /// crowd extent, not grid size.
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
-  [UpdateAfter(typeof(CCUnitSpawnSystem))]
+  [UpdateAfter(typeof(CCSchedulerSystem))]
   [BurstCompile]
   public partial struct CCSpatialHashSystem : ISystem
   {
@@ -30,6 +30,7 @@ namespace Yohash.ECSContinuumCrowds
       _hashQuery = state.GetEntityQuery(ComponentType.ReadWrite<CCStampingHash>());
       state.RequireForUpdate<GlobalFields>();
       state.RequireForUpdate<CCSolveTick>();
+      state.RequireForUpdate<CCStampState>();
       state.RequireForUpdate<CCConstants>();
     }
 
@@ -37,6 +38,12 @@ namespace Yohash.ECSContinuumCrowds
     {
       if (!_hashQuery.IsEmptyIgnoreFilter) {
         state.CompleteDependency();
+        // the gather chain is manually chained (untracked); complete it
+        // before disposing the map it reads
+        var stampQuery = state.GetEntityQuery(ComponentType.ReadOnly<CCStampState>());
+        if (!stampQuery.IsEmptyIgnoreFilter) {
+          stampQuery.GetSingleton<CCStampState>().Handle.Complete();
+        }
         _hashQuery.GetSingleton<CCStampingHash>().Dispose();
       }
     }
@@ -74,10 +81,14 @@ namespace Yohash.ECSContinuumCrowds
       hashRW.ValueRW.BucketDims = bucketDims;
       var hash = hashRW.ValueRO;
 
+      // WAR guard: last tick's gather (stored in CCStampState) may still be
+      // reading the map from a chain that spans frames
+      var stampState = SystemAPI.GetSingletonRW<CCStampState>();
       var clear = new ClearHashJob {
         Map = hash.Map,
         Occupied = hash.OccupiedBuckets,
-      }.Schedule(state.Dependency);
+      }.Schedule(Unity.Jobs.JobHandle.CombineDependencies(
+        state.Dependency, stampState.ValueRO.Handle));
 
       var build = new BuildHashJob {
         Origin = fields.Origin,
@@ -88,7 +99,7 @@ namespace Yohash.ECSContinuumCrowds
         Occupied = hash.OccupiedBuckets,
       }.ScheduleParallel(_unitQuery, clear);
 
-      state.Dependency = new BuildActiveCellsJob {
+      var tail = new BuildActiveCellsJob {
         Gi = gi,
         BucketCells = bucketCells,
         BucketDims = bucketDims,
@@ -96,6 +107,11 @@ namespace Yohash.ECSContinuumCrowds
         Active = hash.ActiveBuckets,
         ActiveCells = hash.ActiveCells,
       }.Schedule(build);
+      // the build job touches entity data (unit transforms), so it must be
+      // tracked by state.Dependency; the stamp system consumes the same tail
+      // through CCStampState to build its cross-frame chain
+      state.Dependency = tail;
+      stampState.ValueRW.Handle = tail;
     }
 
     private static CCStampingHash Allocate(int unitCount, int bucketCount, in GridIndexer gi)

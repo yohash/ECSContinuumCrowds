@@ -5,20 +5,20 @@ using Unity.Mathematics;
 namespace Yohash.ECSContinuumCrowds
 {
   /// <summary>
-  /// Group lifecycle (spec §3.4): for each new group, allocates the
-  /// persistent per-group solve buffers (Phase 1: full-grid sized — compact
-  /// flood-fill domains arrive in Phase 3), converts the authored world-space
-  /// goal rect into <see cref="GoalCell"/> entries, and attaches the cleanup
-  /// component so destruction cannot leak native containers. Disposes
-  /// buffers of destroyed groups.
-  ///
-  /// Structural changes happen here on the main thread at init/destroy only
-  /// — never on the per-frame hot path.
+  /// Group lifecycle (spec §3.4): allocates each new group's domain cache +
+  /// compact solve buffers (grown 1.5× by the scheduler as domains demand —
+  /// spec §8.5), converts the authored world-space goal rect into GoalCell
+  /// entries + the goal set/list, assigns the stagger slot (spec §12.3), and
+  /// attaches the cleanup component so destruction cannot leak containers —
+  /// including mid-solve (the cleanup carries the chain tail and completes
+  /// it before disposal). Disposes buffers of destroyed groups.
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
-  [UpdateAfter(typeof(CCSolveTickSystem))]
+  [UpdateBefore(typeof(CCSchedulerSystem))]
   public partial struct CCGroupInitSystem : ISystem
   {
+    private int _nextSlot;
+
     public void OnCreate(ref SystemState state)
     {
       state.RequireForUpdate<GlobalFields>();
@@ -28,10 +28,8 @@ namespace Yohash.ECSContinuumCrowds
     {
       var em = state.EntityManager;
 
-      // dispose buffers of destroyed groups (cleanup-component pattern).
-      // Phase-3 note: once solves span frames, disposal must wait on the
-      // group's in-flight JobHandle (Dispose(JobHandle)); in Phase 1 the
-      // chain completes within the frame, so direct disposal is safe.
+      // dispose buffers of destroyed groups (cleanup-component pattern);
+      // Dispose() completes the mirrored chain tail first (spec §12.4)
       var orphanQuery = SystemAPI.QueryBuilder()
         .WithAll<GroupFieldBuffersCleanup>().WithNone<CCGroup>().Build();
       if (!orphanQuery.IsEmptyIgnoreFilter) {
@@ -43,7 +41,6 @@ namespace Yohash.ECSContinuumCrowds
         }
       }
 
-      // initialize new groups
       var newQuery = SystemAPI.QueryBuilder()
         .WithAll<CCGroup, CCGroupGoalRect>().WithNone<CCGroupInitialized>().Build();
       if (newQuery.IsEmptyIgnoreFilter) {
@@ -52,32 +49,10 @@ namespace Yohash.ECSContinuumCrowds
 
       var fields = SystemAPI.GetSingleton<GlobalFields>();
       var gi = fields.Indexer;
-      int cells = gi.CellCount;
+      const int initialCapacity = 1024;
 
       var entities = newQuery.ToEntityArray(Allocator.Temp);
       foreach (var e in entities) {
-        var buffers = new GroupFieldBuffers {
-          F = new NativeArray<float4>(cells, Allocator.Persistent),
-          C = new NativeArray<float4>(cells, Allocator.Persistent),
-          Phi = new NativeArray<float>(cells, Allocator.Persistent),
-          Velocity0 = new NativeArray<float2>(cells, Allocator.Persistent),
-          CellState = new NativeArray<byte>(cells, Allocator.Persistent),
-          HeapCells = new NativeArray<int>(cells, Allocator.Persistent),
-          HeapKeys = new NativeArray<float>(cells, Allocator.Persistent),
-          HeapPos = new NativeArray<int>(cells, Allocator.Persistent),
-        };
-        em.AddComponentData(e, buffers);
-        em.AddComponentData(e, new GroupFieldBuffersCleanup {
-          F = buffers.F,
-          C = buffers.C,
-          Phi = buffers.Phi,
-          Velocity0 = buffers.Velocity0,
-          CellState = buffers.CellState,
-          HeapCells = buffers.HeapCells,
-          HeapKeys = buffers.HeapKeys,
-          HeapPos = buffers.HeapPos,
-        });
-
         // authored world-space goal rect -> clamped goal cells
         var rect = em.GetComponentData<CCGroupGoalRect>(e);
         var lo = (int2)math.floor((rect.MinXZ - fields.Origin) / fields.CellSize);
@@ -92,14 +67,67 @@ namespace Yohash.ECSContinuumCrowds
             goals.Add(new GoalCell { Cell = new int2(x, y) });
           }
         }
+        int goalCount = goals.Length;
 
+        var domain = new DomainCache {
+          Cells = new NativeList<int>(initialCapacity, Allocator.Persistent),
+          // full-grid capacity so the fill job never needs a resize (spec §8.5)
+          GlobalToLocal = new NativeParallelHashMap<int, int>(gi.CellCount, Allocator.Persistent),
+          NeighborLocalIdx = new NativeList<int4>(initialCapacity, Allocator.Persistent),
+          GoalSet = new NativeParallelHashMap<int, byte>(
+            math.max(64, goalCount * 2), Allocator.Persistent),
+          GoalCellList = new NativeList<int2>(math.max(64, goalCount), Allocator.Persistent),
+          DirtyFlags = new NativeArray<byte>(2, Allocator.Persistent),
+          Valid = false,
+        };
+        goals = em.GetBuffer<GoalCell>(e); // re-fetch (container ops above are safe, but be explicit)
+        for (int i = 0; i < goals.Length; i++) {
+          domain.GoalSet.TryAdd(gi.Flat(goals[i].Cell), 1);
+          domain.GoalCellList.Add(goals[i].Cell);
+        }
+
+        var buffers = new GroupFieldBuffers {
+          F = new NativeArray<float4>(initialCapacity, Allocator.Persistent),
+          C = new NativeArray<float4>(initialCapacity, Allocator.Persistent),
+          Phi = new NativeArray<float>(initialCapacity, Allocator.Persistent),
+          CellState = new NativeArray<byte>(initialCapacity, Allocator.Persistent),
+          HeapCells = new NativeArray<int>(initialCapacity, Allocator.Persistent),
+          HeapKeys = new NativeArray<float>(initialCapacity, Allocator.Persistent),
+          HeapPos = new NativeArray<int>(initialCapacity, Allocator.Persistent),
+          Velocity0 = new NativeArray<float2>(initialCapacity, Allocator.Persistent),
+          Velocity1 = new NativeArray<float2>(initialCapacity, Allocator.Persistent),
+          LocalIdxLookup0 = new NativeArray<int>(gi.CellCount, Allocator.Persistent),
+          LocalIdxLookup1 = new NativeArray<int>(gi.CellCount, Allocator.Persistent),
+        };
+        // both snapshots start empty: advection samples zero velocity until
+        // the first solve flips a real snapshot in
+        for (int i = 0; i < gi.CellCount; i++) {
+          buffers.LocalIdxLookup0[i] = -1;
+          buffers.LocalIdxLookup1[i] = -1;
+        }
+
+        var group = em.GetComponentData<CCGroup>(e);
+        group.Phase = SolvePhase.Idle;
+        group.ScheduleSlot = _nextSlot++;
+        group.ActiveBuffer = 0;
+        em.SetComponentData(e, group);
+
+        em.AddComponentData(e, domain);
+        em.AddComponentData(e, buffers);
+        em.AddComponentData(e, new CCGroupSolveState());
+        em.AddComponent<CCGroupSolveRequest>(e);
+        em.SetComponentEnabled<CCGroupSolveRequest>(e, false);
+        em.AddComponentData(e, new GroupFieldBuffersCleanup {
+          Buffers = buffers,
+          Domain = domain,
+        });
         em.AddComponent<CCGroupInitialized>(e);
       }
     }
 
     public void OnDestroy(ref SystemState state)
     {
-      // world teardown: dispose every group's buffers
+      // world teardown: dispose every group's containers
       var query = SystemAPI.QueryBuilder().WithAll<GroupFieldBuffersCleanup>().Build();
       var cleanups = query.ToComponentDataArray<GroupFieldBuffersCleanup>(Allocator.Temp);
       foreach (var c in cleanups) {

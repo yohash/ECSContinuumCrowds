@@ -7,40 +7,47 @@ using Unity.Mathematics;
 namespace Yohash.ECSContinuumCrowds
 {
   /// <summary>
-  /// Speed/cost field pass (spec §2.4–2.5): on solve ticks, computes each
-  /// group's anisotropic f and C float4 fields over the (Phase-1 full-grid)
-  /// domain, reading the freshly stamped global ρ/v̄/g/∇h with the into-cell
-  /// rule. Group jobs are independent (read-only shared inputs, private
-  /// outputs) and run concurrently.
+  /// Speed/cost field pass (spec §2.4–2.5) over each requested group's
+  /// compact domain (spec §8.3): reads the freshly stamped global ρ/v̄/g/∇h
+  /// with the into-cell rule via the domain's neighbor table (zero hashing),
+  /// writes domain-compact F/C.
+  ///
+  /// Multi-frame chaining (Decision D7): jobs are appended to the group's
+  /// ChainTail with the shared stamp handle as input — NEVER to
+  /// state.Dependency — so in-flight solves cannot serialize against the
+  /// per-frame advection/min-distance passes. The scheduler polls the tail.
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
-  [UpdateAfter(typeof(CCStampingSystem))]
+  [UpdateAfter(typeof(CCDomainSystem))]
   [BurstCompile]
   public partial struct CCFieldSystem : ISystem
   {
     public void OnCreate(ref SystemState state)
     {
       state.RequireForUpdate<GlobalFields>();
-      state.RequireForUpdate<CCSolveTick>();
       state.RequireForUpdate<CCConstants>();
+      state.RequireForUpdate<CCStampState>();
     }
 
     [BurstCompile]
     public void OnUpdate(ref SystemState state)
     {
-      if (!SystemAPI.GetSingleton<CCSolveTick>().SolveThisFrame) {
-        return;
-      }
-
       var fields = SystemAPI.GetSingleton<GlobalFields>();
       var constants = SystemAPI.GetSingleton<CCConstants>();
+      var stamp = SystemAPI.GetSingleton<CCStampState>();
 
-      var handles = new NativeList<JobHandle>(8, Allocator.Temp);
-      foreach (var (group, buffers) in
-        SystemAPI.Query<RefRO<CCGroup>, RefRO<GroupFieldBuffers>>()
-          .WithAll<CCGroupInitialized>()) {
-        handles.Add(new FieldJob {
-          Gi = fields.Indexer,
+      foreach (var (group, domain, buffers, solveState) in
+        SystemAPI.Query<RefRO<CCGroup>, RefRO<DomainCache>, RefRW<GroupFieldBuffers>, RefRW<CCGroupSolveState>>()
+          .WithAll<CCGroupInitialized, CCGroupSolveRequest>()) {
+        int count = domain.ValueRO.Cells.Length;
+        buffers.ValueRW.DomainLength = count;
+        if (count == 0) {
+          continue; // empty domain (e.g. goal on unwalkable ground) — velocity pass clears the lookup
+        }
+
+        solveState.ValueRW.ChainTail = new FieldJob {
+          Cells = domain.ValueRO.Cells.AsArray(),
+          Neighbors = domain.ValueRO.NeighborLocalIdx.AsArray(),
           Rho = fields.Rho,
           VAve = fields.VAveAcc, // holds v̄ after the stamping finalize pass
           Discomfort = fields.Discomfort,
@@ -51,17 +58,16 @@ namespace Yohash.ECSContinuumCrowds
           Gamma = group.ValueRO.Gamma,
           F = buffers.ValueRO.F,
           C = buffers.ValueRO.C,
-        }.Schedule(fields.Rho.Length, 256, state.Dependency));
-      }
-      if (handles.Length > 0) {
-        state.Dependency = JobHandle.CombineDependencies(handles.AsArray());
+        }.Schedule(count, 128,
+          JobHandle.CombineDependencies(stamp.Handle, solveState.ValueRO.ChainTail));
       }
     }
 
     [BurstCompile]
     private struct FieldJob : IJobParallelFor
     {
-      public GridIndexer Gi;
+      [ReadOnly] public NativeArray<int> Cells;
+      [ReadOnly] public NativeArray<int4> Neighbors;
       [ReadOnly] public NativeArray<float> Rho;
       [ReadOnly] public NativeArray<float2> VAve;
       [ReadOnly] public NativeArray<float> Discomfort;
@@ -70,16 +76,16 @@ namespace Yohash.ECSContinuumCrowds
       public float Alpha;
       public float Beta;
       public float Gamma;
-      [WriteOnly] public NativeArray<float4> F;
-      [WriteOnly] public NativeArray<float4> C;
+      [NativeDisableParallelForRestriction] public NativeArray<float4> F;
+      [NativeDisableParallelForRestriction] public NativeArray<float4> C;
 
-      public void Execute(int i)
+      public void Execute(int local)
       {
         CCFieldOps.ComputeCell(
-          i, Gi, Rho, VAve, Discomfort, DH, Constants, Alpha, Beta, Gamma,
-          out var f, out var c);
-        F[i] = f;
-        C[i] = c;
+          local, Cells, Neighbors, Rho, VAve, Discomfort, DH,
+          Constants, Alpha, Beta, Gamma, out var f, out var c);
+        F[local] = f;
+        C[local] = c;
       }
     }
   }

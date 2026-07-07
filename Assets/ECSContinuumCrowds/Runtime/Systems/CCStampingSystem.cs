@@ -7,22 +7,19 @@ using Unity.Mathematics;
 namespace Yohash.ECSContinuumCrowds
 {
   /// <summary>
-  /// Gather-pattern stamping (Decision D3, spec §6 — replaces the Phase-1
-  /// naive scatter, whose semantics live on as the test oracle in
-  /// CCStampOps.Scatter*): a parallel job over the ACTIVE cells derived by
-  /// CCSpatialHashSystem, each cell pulling static-splat + predictive-ghost
-  /// contributions from units in its 9 surrounding buckets. Every cell is
-  /// written by exactly one thread — no write races, no atomics, no
-  /// reduction pass.
+  /// Gather-pattern stamping (Decision D3, spec §6): parallel job over the
+  /// ACTIVE cells derived by CCSpatialHashSystem, each cell pulling
+  /// static-splat + predictive-ghost contributions from units in its 9
+  /// surrounding buckets. Runs once per solve tick for ALL groups scheduled
+  /// that tick (spec §2.8).
   ///
-  ///   ρ[c]    = Σᵢ (wᵢ(c) + wpᵢ(c)) · massᵢ
-  ///   v̄acc[c] = Σᵢ (wᵢ(c) + wpᵢ(c)) · massᵢ · velocityᵢ → v̄ = acc/ρ
-  ///
-  /// ⚠ DIVERGENCE (repo extension, kept): mass scaling (the paper has none).
-  ///
-  /// Field clear: the full grid is cleared each stamp tick (~3 MB of writes
-  /// at 512²) — spec §6.2 explicitly prefers this simple form first; the
-  /// tracked previous-active-set clear is a measured Phase-4 option.
+  /// Chaining (Decision D7): the stamp chain is stored in CCStampState (not
+  /// state.Dependency) and consumed by every scheduled group's field pass.
+  /// Its input combines the hash tail with every group's ChainTail — an
+  /// in-flight solve from an earlier tick may still be READING the global
+  /// ρ/v̄ map, so the clear/gather must not start until those readers land
+  /// (conservative write-after-read guard; runs on workers, never stalls
+  /// the main thread).
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
   [UpdateAfter(typeof(CCSpatialHashSystem))]
@@ -47,11 +44,18 @@ namespace Yohash.ECSContinuumCrowds
       var fields = SystemAPI.GetSingleton<GlobalFields>();
       var constants = SystemAPI.GetSingleton<CCConstants>();
       var hash = SystemAPI.GetSingleton<CCStampingHash>();
+      ref var stamp = ref SystemAPI.GetSingletonRW<CCStampState>().ValueRW;
+
+      // WAR guard: in-flight chains read the global map
+      var dep = stamp.Handle;
+      foreach (var solveState in SystemAPI.Query<RefRO<CCGroupSolveState>>().WithAll<CCGroup>()) {
+        dep = JobHandle.CombineDependencies(dep, solveState.ValueRO.ChainTail);
+      }
 
       var clear = new ClearFieldsJob {
         Rho = fields.Rho,
         VAveAcc = fields.VAveAcc,
-      }.Schedule(fields.Rho.Length, 8192, state.Dependency);
+      }.Schedule(fields.Rho.Length, 8192, dep);
 
       var gather = new GatherStampJob {
         Gi = fields.Indexer,
@@ -65,7 +69,7 @@ namespace Yohash.ECSContinuumCrowds
         VAveAcc = fields.VAveAcc,
       }.Schedule(hash.ActiveCells, 64, clear);
 
-      state.Dependency = new FinalizeAverageVelocityJob {
+      stamp.Handle = new FinalizeAverageVelocityJob {
         Rho = fields.Rho,
         VAveAcc = fields.VAveAcc,
       }.Schedule(fields.Rho.Length, 8192, gather);

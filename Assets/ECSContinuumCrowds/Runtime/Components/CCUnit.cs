@@ -32,12 +32,16 @@ namespace Yohash.ECSContinuumCrowds
   }
 
   /// <summary>
-  /// Current unit velocity in grid space (cells/second) — written by
-  /// advection, read by stamping.
+  /// Current unit velocity (world units/second, XZ) — written by advection,
+  /// read by stamping. StallSeconds accumulates while the sampled speed is
+  /// ≈ 0 (and the unit hasn't arrived); past CCSolveSettings.StallSeconds it
+  /// raises the group's stall trigger → domain refresh with doubled pad
+  /// (spec §8.6).
   /// </summary>
   public struct UnitVelocity : IComponentData
   {
     public float2 Value;
+    public float StallSeconds;
   }
 
   /// <summary>
