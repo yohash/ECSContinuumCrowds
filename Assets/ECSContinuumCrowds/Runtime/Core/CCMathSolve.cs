@@ -215,47 +215,56 @@ namespace Yohash.ECSContinuumCrowds
     }
 
     /// <summary>
-    /// Shipping gradient (Decision D10, GradientScheme.CentralRepo): central
-    /// difference with infinity fallback, normalized (zero-safe). See
-    /// GradientScheme docs for the recorded trade-off vs the paper's upwind
-    /// scheme.
+    /// Shipping gradient (Decision D10, GradientScheme.CentralRepo) over a
+    /// compact domain: central difference with infinity fallback, normalized
+    /// (zero-safe). Neighbor access goes through the domain's
+    /// NeighborLocalIdx table: a −1 entry (out of domain — wall, unwalkable,
+    /// or beyond the pad) reads as +∞ and takes the ±1 one-sided fallback,
+    /// while GRID-edge cells reproduce the repo's clamped one-sided
+    /// differences exactly (the repo's enumerated edge cases; parity-tested
+    /// through identity domains). See GradientScheme docs for the recorded
+    /// trade-off vs the paper's upwind scheme.
     /// </summary>
     public static float2 PotentialGradientCentral(
-      in NativeArray<float> phi, in GridIndexer gi, int2 c)
+      in NativeArray<float> phi, int local, int2 cellCoord, int4 neighbors, in GridIndexer gi)
     {
-      int xLo = math.max(c.x - 1, 0);
-      int xHi = math.min(c.x + 1, gi.W - 1);
-      int yLo = math.max(c.y - 1, 0);
-      int yHi = math.min(c.y + 1, gi.H - 1);
+      float pc = phi[local];
 
-      float dx = GradientAxisCentral(phi[gi.Flat(xLo, c.y)], phi[gi.Flat(xHi, c.y)], xHi - xLo);
-      float dy = GradientAxisCentral(phi[gi.Flat(c.x, yLo)], phi[gi.Flat(c.x, yHi)], yHi - yLo);
+      bool loEdge = cellCoord.x == 0;
+      bool hiEdge = cellCoord.x == gi.W - 1;
+      float lo = loEdge ? pc : Read(phi, neighbors[DirW]);
+      float hi = hiEdge ? pc : Read(phi, neighbors[DirE]);
+      float dx = GradientAxisCentral(lo, hi, loEdge || hiEdge ? 1 : 2);
+
+      loEdge = cellCoord.y == 0;
+      hiEdge = cellCoord.y == gi.H - 1;
+      lo = loEdge ? pc : Read(phi, neighbors[DirS]);
+      hi = hiEdge ? pc : Read(phi, neighbors[DirN]);
+      float dy = GradientAxisCentral(lo, hi, loEdge || hiEdge ? 1 : 2);
 
       return math.normalizesafe(new float2(dx, dy));
     }
 
     /// <summary>
-    /// Reference gradient (Decision D10, GradientScheme.UpwindPaper): per
-    /// axis, difference φ against the upwind (lower-φ) neighbor — the same
-    /// neighbor the eikonal update selected. Consistent with the discrete
-    /// solution's characteristics; decisively picks a side at shocklines
-    /// (direction quantization, hard flips across shockline cells). Debug /
-    /// reference use; central-repo is the shipping path.
+    /// Reference gradient (Decision D10, GradientScheme.UpwindPaper) over a
+    /// compact domain: per axis, difference φ against the upwind (lower-φ)
+    /// neighbor — the same neighbor the eikonal update selected. Consistent
+    /// with the discrete solution's characteristics; decisively picks a side
+    /// at shocklines (direction quantization, hard flips across shockline
+    /// cells). Debug / reference use; central-repo is the shipping path.
     /// </summary>
     public static float2 PotentialGradientUpwind(
-      in NativeArray<float> phi, in GridIndexer gi, int2 c)
+      in NativeArray<float> phi, int local, int4 neighbors)
     {
-      float pc = phi[gi.Flat(c)];
-      float pxLo = c.x > 0 ? phi[gi.Flat(c.x - 1, c.y)] : float.PositiveInfinity;
-      float pxHi = c.x < gi.W - 1 ? phi[gi.Flat(c.x + 1, c.y)] : float.PositiveInfinity;
-      float pyLo = c.y > 0 ? phi[gi.Flat(c.x, c.y - 1)] : float.PositiveInfinity;
-      float pyHi = c.y < gi.H - 1 ? phi[gi.Flat(c.x, c.y + 1)] : float.PositiveInfinity;
-
-      float dx = GradientAxisUpwind(pc, pxLo, pxHi);
-      float dy = GradientAxisUpwind(pc, pyLo, pyHi);
-
+      float pc = phi[local];
+      float dx = GradientAxisUpwind(pc, Read(phi, neighbors[DirW]), Read(phi, neighbors[DirE]));
+      float dy = GradientAxisUpwind(pc, Read(phi, neighbors[DirS]), Read(phi, neighbors[DirN]));
       return math.normalizesafe(new float2(dx, dy));
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float Read(in NativeArray<float> phi, int local)
+      => local >= 0 ? phi[local] : float.PositiveInfinity;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float GradientAxisUpwind(float pc, float phiLo, float phiHi)
@@ -295,14 +304,18 @@ namespace Yohash.ECSContinuumCrowds
     // *************************************************************************
 
     /// <summary>
-    /// Bilinear sample of a per-cell velocity field at a grid-space
-    /// position. Corners outside the grid get weight 0 and the remaining
-    /// weights are renormalized (velocity fades gracefully at the fringe
-    /// rather than snapping to zero). Phase-3 note: out-of-DOMAIN corners
-    /// will use the same renormalization via the snapshot's localIdxLookup.
+    /// Bilinear sample of a snapshot velocity buffer at a grid-space
+    /// position (spec §13.1 + §12.2): the buffer is domain-compact and is
+    /// interpreted through ITS OWN full-grid localIdxLookup snapshot —
+    /// corners outside the grid or outside the snapshot domain (lookup −1)
+    /// get weight 0 and the remaining weights are renormalized, so velocity
+    /// fades gracefully at the padded fringe rather than snapping to zero.
     /// </summary>
     public static float2 BilinearSampleVelocity(
-      in NativeArray<float2> velocity, in GridIndexer gi, float2 pos)
+      in NativeArray<float2> velocity,
+      in NativeArray<int> localIdxLookup,
+      in GridIndexer gi,
+      float2 pos)
     {
       var baseCell = SplatBaseCell(pos);
       var d = SplatDelta(pos);
@@ -314,8 +327,12 @@ namespace Yohash.ECSContinuumCrowds
           if (!gi.InBounds(cell)) {
             continue;
           }
+          int local = localIdxLookup[gi.Flat(cell)];
+          if (local < 0) {
+            continue; // outside this snapshot's domain
+          }
           float w = (dx == 0 ? 1f - d.x : d.x) * (dy == 0 ? 1f - d.y : d.y);
-          acc += velocity[gi.Flat(cell)] * w;
+          acc += velocity[local] * w;
           wSum += w;
         }
       }

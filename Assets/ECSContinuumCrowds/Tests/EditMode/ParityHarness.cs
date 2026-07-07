@@ -109,15 +109,59 @@ namespace Yohash.ECSContinuumCrowds.Tests
       DynamicGlobalFields.InitiateTile(tile, ref tiles, tile.Hash);
     }
 
-    /// <summary>Our field pass: the exact per-cell function the FieldJob runs.</summary>
+    /// <summary>
+    /// Identity domain: local index == global flat index, ALL cells included
+    /// (even unwalkable ones, for repo-parity semantics — the FMM's explicit
+    /// g ≥ 1 checks then behave exactly like the Phase-1 full-grid solver).
+    /// This is how the parity suite drives the compact-domain cores.
+    /// </summary>
+    public struct IdentityDomain : IDisposable
+    {
+      public NativeArray<int> Cells;
+      public NativeArray<int4> Neighbors;
+      public NativeParallelHashMap<int, int> GlobalToLocal;
+
+      public static IdentityDomain Build(in GridIndexer gi)
+      {
+        var d = new IdentityDomain {
+          Cells = new NativeArray<int>(gi.CellCount, Allocator.Temp),
+          Neighbors = new NativeArray<int4>(gi.CellCount, Allocator.Temp),
+          GlobalToLocal = new NativeParallelHashMap<int, int>(gi.CellCount, Allocator.Temp),
+        };
+        for (int i = 0; i < gi.CellCount; i++) {
+          d.Cells[i] = i;
+          d.GlobalToLocal.TryAdd(i, i);
+          var c = gi.Coord(i);
+          var entry = new int4(-1);
+          for (int dir = 0; dir < CCMath.NumDirections; dir++) {
+            var n = c + CCMath.ENSWint(dir);
+            if (gi.InBounds(n)) {
+              entry[dir] = gi.Flat(n);
+            }
+          }
+          d.Neighbors[i] = entry;
+        }
+        return d;
+      }
+
+      public void Dispose()
+      {
+        Cells.Dispose();
+        Neighbors.Dispose();
+        GlobalToLocal.Dispose();
+      }
+    }
+
+    /// <summary>Our field pass: the exact per-cell function the FieldJob runs (identity domain).</summary>
     public static (NativeArray<float4> f, NativeArray<float4> c) RunOurFields(
       in OurGrid grid, in CCConstants constants, float alpha, float beta, float gamma)
     {
+      using var dom = IdentityDomain.Build(grid.Gi);
       var f = new NativeArray<float4>(grid.Gi.CellCount, Allocator.Temp);
       var c = new NativeArray<float4>(grid.Gi.CellCount, Allocator.Temp);
       for (int i = 0; i < grid.Gi.CellCount; i++) {
         CCFieldOps.ComputeCell(
-          i, grid.Gi, grid.Rho, grid.VAve, grid.G, grid.DH,
+          i, dom.Cells, dom.Neighbors, grid.Rho, grid.VAve, grid.G, grid.DH,
           constants, alpha, beta, gamma, out var fv, out var cv);
         f[i] = fv;
         c[i] = cv;
@@ -137,30 +181,37 @@ namespace Yohash.ECSContinuumCrowds.Tests
       return ((float[,])phiField.GetValue(done), done.Velocity);
     }
 
-    /// <summary>Our FMM: the exact CCFmmSolver.Solve the eikonal job runs.</summary>
+    /// <summary>Our FMM: the exact CCFmmSolver.Solve the eikonal job runs (identity domain).</summary>
     public static (NativeArray<float> phi, NativeArray<byte> state) RunOurFmm(
       in OurGrid grid, in NativeArray<float4> c, int2[] goals, in CCConstants constants)
     {
+      using var dom = IdentityDomain.Build(grid.Gi);
       int cells = grid.Gi.CellCount;
       var phi = new NativeArray<float>(cells, Allocator.Temp);
       var state = new NativeArray<byte>(cells, Allocator.Temp);
       var heapCells = new NativeArray<int>(cells, Allocator.Temp);
       var heapKeys = new NativeArray<float>(cells, Allocator.Temp);
       var heapPos = new NativeArray<int>(cells, Allocator.Temp);
-      var goalArray = new NativeArray<int2>(goals, Allocator.Temp);
+      using var goalArray = new NativeArray<int2>(goals, Allocator.Temp);
       CCFmmSolver.Solve(
-        grid.Gi, c, grid.G, goalArray, constants.maxWeight, constants.minWeight,
+        cells, dom.Cells, dom.Neighbors, dom.GlobalToLocal, grid.Gi, c, grid.G,
+        goalArray, constants.maxWeight, constants.minWeight,
         phi, state, heapCells, heapKeys, heapPos);
+      heapCells.Dispose();
+      heapKeys.Dispose();
+      heapPos.Dispose();
       return (phi, state);
     }
 
-    /// <summary>Our velocity derivation (central-repo scheme) from φ and f.</summary>
+    /// <summary>Our velocity derivation (central-repo scheme) from φ and f (identity domain).</summary>
     public static NativeArray<float2> RunOurVelocity(
       in OurGrid grid, in NativeArray<float> phi, in NativeArray<float4> f)
     {
+      using var dom = IdentityDomain.Build(grid.Gi);
       var velocity = new NativeArray<float2>(grid.Gi.CellCount, Allocator.Temp);
       for (int i = 0; i < grid.Gi.CellCount; i++) {
-        var dPhi = CCMath.PotentialGradientCentral(phi, grid.Gi, grid.Gi.Coord(i));
+        var dPhi = CCMath.PotentialGradientCentral(
+          phi, i, grid.Gi.Coord(i), dom.Neighbors[i], grid.Gi);
         velocity[i] = CCMath.VelocityFromGradient(dPhi, f[i]);
       }
       return velocity;

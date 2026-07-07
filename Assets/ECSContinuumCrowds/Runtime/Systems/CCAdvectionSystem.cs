@@ -8,16 +8,23 @@ namespace Yohash.ECSContinuumCrowds
 {
   /// <summary>
   /// Per-frame advection (spec §13.1, Decision D11): every unit bilinearly
-  /// samples its group's velocity field at its grid position and
-  /// Euler-integrates. Euler is deliberate — paper §4.4: higher-order
-  /// integration (RK) made no appreciable difference.
+  /// samples its group's FRONT velocity buffer through that buffer's
+  /// full-grid localIdxLookup snapshot (spec §12.2 — O(1), no hashing) and
+  /// Euler-integrates (paper §4.4: RK made no appreciable difference).
+  /// Because solves only ever write the BACK pair, this system runs every
+  /// frame with zero dependency on in-flight solve chains (Decision D7).
   ///
-  /// Velocity conventions: field values are world-units/second in the XZ
-  /// plane; grid displacement divides by CellSize. UnitVelocity stores
-  /// world-units/second (what stamping's momentum term needs).
+  /// Also raises the domain-cache hard triggers (spec §8.4/§8.6):
+  /// - escape: the unit's cell is outside the front snapshot domain
+  ///   (lookup −1) → DirtyFlags[0]. (⚠ NOTE: the spec words this against
+  ///   the "cached live domain"; we test against the front SNAPSHOT — the
+  ///   thing actually being sampled — which is safe to read concurrently
+  ///   and strictly more conservative: the live domain is always ⊇ current
+  ///   needs when valid.)
+  /// - stall: sampled speed ≈ 0 for > StallSeconds → DirtyFlags[1]
+  ///   (scheduler refreshes with doubled pad and logs it).
   ///
-  /// Arrival: when a unit's cell carries the solver's Goal flag, tag it
-  /// UnitArrived via ECB — it stops advecting; consumers react to the tag.
+  /// Arrival: cell ∈ the group's GoalSet → UnitArrived via ECB.
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
   [UpdateAfter(typeof(CCVelocityDerivationSystem))]
@@ -27,6 +34,7 @@ namespace Yohash.ECSContinuumCrowds
     public void OnCreate(ref SystemState state)
     {
       state.RequireForUpdate<GlobalFields>();
+      state.RequireForUpdate<CCSolveSettings>();
       state.RequireForUpdate<EndSimulationEntityCommandBufferSystem.Singleton>();
     }
 
@@ -34,24 +42,25 @@ namespace Yohash.ECSContinuumCrowds
     public void OnUpdate(ref SystemState state)
     {
       var fields = SystemAPI.GetSingleton<GlobalFields>();
+      var settings = SystemAPI.GetSingleton<CCSolveSettings>();
       var ecb = SystemAPI.GetSingleton<EndSimulationEntityCommandBufferSystem.Singleton>()
         .CreateCommandBuffer(state.WorldUnmanaged).AsParallelWriter();
       float dt = SystemAPI.Time.DeltaTime;
 
-      // one pass per group (Phase 1: typically one). Each pass touches only
-      // its group's units via the GroupId branch — a predictable branch,
-      // cheap under Burst (spec §3.2). The Phase-3 scheduler replaces this
-      // with per-group buffer tables indexed by GroupId.
-      foreach (var (group, buffers) in
-        SystemAPI.Query<RefRO<CCGroup>, RefRO<GroupFieldBuffers>>()
+      foreach (var (group, domain, buffers) in
+        SystemAPI.Query<RefRO<CCGroup>, RefRO<DomainCache>, RefRO<GroupFieldBuffers>>()
           .WithAll<CCGroupInitialized>()) {
+        int front = group.ValueRO.ActiveBuffer;
         state.Dependency = new AdvectionJob {
           GroupId = group.ValueRO.GroupId,
           Gi = fields.Indexer,
           Origin = fields.Origin,
           CellSize = fields.CellSize,
-          Velocity = buffers.ValueRO.Velocity0,
-          CellState = buffers.ValueRO.CellState,
+          Velocity = front == 0 ? buffers.ValueRO.Velocity0 : buffers.ValueRO.Velocity1,
+          Lookup = front == 0 ? buffers.ValueRO.LocalIdxLookup0 : buffers.ValueRO.LocalIdxLookup1,
+          GoalSet = domain.ValueRO.GoalSet,
+          DirtyFlags = domain.ValueRO.DirtyFlags,
+          StallSeconds = settings.StallSeconds,
           Dt = dt,
           Ecb = ecb,
         }.ScheduleParallel(state.Dependency);
@@ -68,7 +77,11 @@ namespace Yohash.ECSContinuumCrowds
       public float2 Origin;
       public float CellSize;
       [ReadOnly] public NativeArray<float2> Velocity;
-      [ReadOnly] public NativeArray<byte> CellState;
+      [ReadOnly] public NativeArray<int> Lookup;
+      [ReadOnly] public NativeParallelHashMap<int, byte> GoalSet;
+      // identical-value byte stores from many threads — benign by construction
+      [NativeDisableParallelForRestriction] public NativeArray<byte> DirtyFlags;
+      public float StallSeconds;
       public float Dt;
       public EntityCommandBuffer.ParallelWriter Ecb;
 
@@ -84,7 +97,7 @@ namespace Yohash.ECSContinuumCrowds
         }
 
         var pos = CCMath.WorldToGrid(transform.Position, Origin, CellSize);
-        var v = CCMath.BilinearSampleVelocity(Velocity, Gi, pos);
+        var v = CCMath.BilinearSampleVelocity(Velocity, Lookup, Gi, pos);
         unitVelocity.Value = v;
 
         // Euler integration; velocity is world-units/sec, position in cells
@@ -93,8 +106,28 @@ namespace Yohash.ECSContinuumCrowds
         transform.Position = CCMath.GridToWorld(pos, Origin, CellSize, transform.Position.y);
 
         var cell = (int2)math.floor(pos);
-        if ((CellState[Gi.Flat(cell)] & CCCellState.Goal) != 0) {
+        int flat = Gi.Flat(cell);
+
+        if (GoalSet.IsCreated && GoalSet.ContainsKey(flat)) {
           Ecb.AddComponent<UnitArrived>(index, entity);
+          return;
+        }
+
+        // escape trigger — only meaningful once a snapshot exists
+        if (Lookup[flat] < 0 && DirtyFlags.IsCreated) {
+          DirtyFlags[0] = 1;
+        }
+
+        // stall detector (spec §8.6): sampled speed ≈ 0 while unsolved OR
+        // truly blocked; fires the doubled-pad refresh after StallSeconds
+        if (math.lengthsq(v) < 1e-4f) {
+          unitVelocity.StallSeconds += Dt;
+          if (unitVelocity.StallSeconds > StallSeconds) {
+            DirtyFlags[1] = 1;
+            unitVelocity.StallSeconds = 0f; // re-arm; scheduler logs the refresh
+          }
+        } else {
+          unitVelocity.StallSeconds = 0f;
         }
       }
     }
