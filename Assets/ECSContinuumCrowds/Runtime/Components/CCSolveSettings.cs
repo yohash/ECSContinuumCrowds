@@ -55,6 +55,27 @@ namespace Yohash.ECSContinuumCrowds
     /// domain refresh with doubled pad (spec §8.6, default 1.5).</summary>
     public float StallSeconds;
 
+    // --- hybrid eikonal decider (Decision D8, spec §10.3) ---
+    /// <summary>Domain size at/above which FIM is preferred (given idle
+    /// workers). PLACEHOLDER 32,768 (≈180², ~12.5% of 512²) to be replaced
+    /// by the crossover benchmark's measured value (spec §10.3); ≤ 0
+    /// disables FIM entirely (FMM always).</summary>
+    public int FimThresholdCells;
+    /// <summary>Minimum expected idle workers for FIM to be worth its
+    /// ~1.5–2.5× work overhead (spec §10.3; placeholder 2).</summary>
+    public int FimMinIdleWorkers;
+    /// <summary>FIM convergence epsilon (spec §10.2: ~1e-3, cost units).</summary>
+    public float FimEps;
+    /// <summary>Parallel relax/compact sweep pairs pre-scheduled per solve
+    /// chain; sweeps past convergence are no-ops over empty deferred lists.
+    /// The serial finisher covers anything beyond.</summary>
+    public int FimParallelSweeps;
+    /// <summary>Hard sweep cap (termination guarantee; hit-cap telemetry
+    /// signals the spec §10.4 fallback should ship).</summary>
+    public int FimMaxSweeps;
+    /// <summary>Iteration root handling (spec §10.4; WeightedBlend ships).</summary>
+    public FimRootMode FimRootMode;
+
     public static CCSolveSettings Defaults => new CCSolveSettings {
       SolveHz = 10f,
       Scheme = GradientScheme.CentralRepo,
@@ -63,6 +84,12 @@ namespace Yohash.ECSContinuumCrowds
       PadCells = 16f,
       HorizonCells = 0,
       StallSeconds = 1.5f,
+      FimThresholdCells = 32768,
+      FimMinIdleWorkers = 2,
+      FimEps = 1e-3f,
+      FimParallelSweeps = 48,
+      FimMaxSweeps = 4096,
+      FimRootMode = FimRootMode.WeightedBlend,
     };
   }
 
@@ -90,6 +117,9 @@ namespace Yohash.ECSContinuumCrowds
     public int CacheHits;          // tick solves that reused a valid domain
     public int EscapeRefreshes;
     public int StallRefreshes;     // spec §8.6: log these; they should be rare
+    public int FmmSolves;          // hybrid decider observability (spec §10.3)
+    public int FimSolves;
+    public int FimHitCaps;         // >0 with WeightedBlend → ship the §10.4 fallback
   }
 
   /// <summary>

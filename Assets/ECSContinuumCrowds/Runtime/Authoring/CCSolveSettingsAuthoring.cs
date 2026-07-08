@@ -24,6 +24,20 @@ namespace Yohash.ECSContinuumCrowds
     [Tooltip("Sampled speed ≈ 0 for longer than this fires a doubled-pad domain refresh (spec §8.6).")]
     [Min(0.1f)] public float stallSeconds = 1.5f;
 
+    [Header("Hybrid eikonal (D8) — placeholder threshold, replace via crossover benchmark")]
+    [Tooltip("Domain size at/above which FIM is preferred; ≤0 = FMM always (spec §10.3 placeholder 32768).")]
+    public int fimThresholdCells = 32768;
+    [Tooltip("Minimum expected idle workers for FIM to pay off (spec §10.3).")]
+    [Min(0)] public int fimMinIdleWorkers = 2;
+    [Tooltip("FIM convergence epsilon (spec §10.2).")]
+    [Min(1e-6f)] public float fimEps = 1e-3f;
+    [Tooltip("Parallel sweep pairs pre-scheduled per FIM chain (extras are no-ops).")]
+    [Min(1)] public int fimParallelSweeps = 48;
+    [Tooltip("Hard sweep cap — hit-cap telemetry signals the §10.4 fallback.")]
+    [Min(8)] public int fimMaxSweeps = 4096;
+    [Tooltip("§10.4: WeightedBlend ships; MaxRootWithBlendedPostPass is the documented fallback.")]
+    public FimRootMode fimRootMode = FimRootMode.WeightedBlend;
+
     private class Baker : Baker<CCSolveSettingsAuthoring>
     {
       public override void Bake(CCSolveSettingsAuthoring authoring)
@@ -37,6 +51,12 @@ namespace Yohash.ECSContinuumCrowds
           PadCells = authoring.padCells,
           HorizonCells = authoring.horizonCells,
           StallSeconds = authoring.stallSeconds,
+          FimThresholdCells = authoring.fimThresholdCells,
+          FimMinIdleWorkers = authoring.fimMinIdleWorkers,
+          FimEps = authoring.fimEps,
+          FimParallelSweeps = authoring.fimParallelSweeps,
+          FimMaxSweeps = authoring.fimMaxSweeps,
+          FimRootMode = authoring.fimRootMode,
         });
       }
     }

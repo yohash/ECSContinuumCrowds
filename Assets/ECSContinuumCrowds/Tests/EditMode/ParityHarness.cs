@@ -203,6 +203,36 @@ namespace Yohash.ECSContinuumCrowds.Tests
       return (phi, state);
     }
 
+    /// <summary>Our FIM (serial driver) — same identity-domain plumbing as RunOurFmm.</summary>
+    public static (NativeArray<float> phi, int sweeps) RunOurFim(
+      in OurGrid grid, in NativeArray<float4> c, int2[] goals, in CCConstants constants,
+      FimRootMode mode, float eps = 1e-3f, int maxSweeps = 4096)
+    {
+      using var dom = IdentityDomain.Build(grid.Gi);
+      int cells = grid.Gi.CellCount;
+      var phi = new NativeArray<float>(cells, Allocator.Temp);
+      var state = new NativeArray<byte>(cells, Allocator.Temp);
+      var clean = new NativeList<int>(cells, Allocator.Temp);
+      var raw = new NativeList<int>(cells * 5, Allocator.Temp);
+      var status = new NativeArray<int>(4, Allocator.Temp);
+      var scratch = new NativeArray<float>(cells, Allocator.Temp);
+      using var goalArray = new NativeArray<int2>(goals, Allocator.Temp);
+      int sweeps = CCFimSolver.SolveSerial(
+        cells, dom.Cells, dom.Neighbors, dom.GlobalToLocal, grid.Gi, c, grid.G,
+        goalArray, eps, maxSweeps, mode, constants.maxWeight, constants.minWeight,
+        phi, state, clean, raw, status, scratch);
+      Assert_NotHitCap(status);
+      state.Dispose(); clean.Dispose(); raw.Dispose(); status.Dispose(); scratch.Dispose();
+      return (phi, sweeps);
+    }
+
+    private static void Assert_NotHitCap(NativeArray<int> status)
+    {
+      NUnit.Framework.Assert.AreEqual(0, status[CCFimSolver.StatusHitCap],
+        "FIM hit its sweep cap on a test grid — the §10.4 weighted-blend " +
+        "instability risk has materialized; ship MaxRootWithBlendedPostPass");
+    }
+
     /// <summary>Our velocity derivation (central-repo scheme) from φ and f (identity domain).</summary>
     public static NativeArray<float2> RunOurVelocity(
       in OurGrid grid, in NativeArray<float> phi, in NativeArray<float4> f)
