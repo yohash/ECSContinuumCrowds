@@ -176,6 +176,12 @@ namespace Yohash.ECSContinuumCrowds
     public NativeArray<int> HeapCells;
     public NativeArray<float> HeapKeys;
     public NativeArray<int> HeapPos;
+    // FIM scratch (Decision D8; sized with the domain). HeapKeys doubles as
+    // the FIM post-pass scratch — FMM and FIM never run in the same chain.
+    public NativeList<int> FimActiveClean;
+    public NativeList<int> FimActiveRaw;   // capacity 5× (self + 4 activations per relax)
+    public NativeArray<int> FimStatus;     // [converged, sweeps, hitCap]
+
     /// <summary>Cell count of the domain the in-flight/last chain was
     /// scheduled over (jobs and the visualizer read compact arrays up to
     /// this length). The live DomainCache is stable for the whole chain —
@@ -200,6 +206,9 @@ namespace Yohash.ECSContinuumCrowds
       if (HeapCells.IsCreated) HeapCells.Dispose();
       if (HeapKeys.IsCreated) HeapKeys.Dispose();
       if (HeapPos.IsCreated) HeapPos.Dispose();
+      if (FimActiveClean.IsCreated) FimActiveClean.Dispose();
+      if (FimActiveRaw.IsCreated) FimActiveRaw.Dispose();
+      if (FimStatus.IsCreated) FimStatus.Dispose();
       if (Velocity0.IsCreated) Velocity0.Dispose();
       if (Velocity1.IsCreated) Velocity1.Dispose();
       if (LocalIdxLookup0.IsCreated) LocalIdxLookup0.Dispose();

@@ -95,6 +95,13 @@ namespace Yohash.ECSContinuumCrowds
           group.LastSolveTime = now;
           group.Phase = SolvePhase.Idle;
           telemetry.SolvesCompleted++;
+          // FIM sweep-cap telemetry (spec §10.4: fires → ship the fallback)
+          var completedBuffers = em.GetComponentData<GroupFieldBuffers>(e);
+          if (completedBuffers.FimStatus.IsCreated
+            && completedBuffers.FimStatus[CCFimSolver.StatusHitCap] != 0) {
+            telemetry.FimHitCaps++;
+            completedBuffers.FimStatus[CCFimSolver.StatusHitCap] = 0;
+          }
           em.SetComponentData(e, group);
           em.SetComponentData(e, solveState);
         } else if (group.Phase == SolvePhase.DomainRefreshing && solveState.ChainTail.IsCompleted) {
@@ -315,6 +322,8 @@ namespace Yohash.ECSContinuumCrowds
         buffers.HeapCells = new NativeArray<int>(newCap, Allocator.Persistent);
         buffers.HeapKeys = new NativeArray<float>(newCap, Allocator.Persistent);
         buffers.HeapPos = new NativeArray<int>(newCap, Allocator.Persistent);
+        buffers.FimActiveClean.SetCapacity(newCap);
+        buffers.FimActiveRaw.SetCapacity(newCap * 5);
       }
       if (!backOk) {
         backVelocity.Dispose();
