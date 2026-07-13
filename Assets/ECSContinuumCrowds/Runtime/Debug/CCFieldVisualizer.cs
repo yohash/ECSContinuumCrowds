@@ -12,8 +12,15 @@ namespace Yohash.ECSContinuumCrowds
   /// of a large grid.
   ///
   /// Scalar modes render a heat ramp (dark blue → cyan → yellow → red, with
-  /// impassable/∞ cells in black); vector modes render arrows. Per-group φ
-  /// and velocity modes will be added when those fields exist (Phase 1+).
+  /// impassable/∞ cells in black); vector modes render arrows. Per-group
+  /// modes (φ, velocity, gradient diff) read the group selected by
+  /// <see cref="groupIndex"/>.
+  ///
+  /// GradientDiff is the shockline diagnostic (Decision D10): it renders the
+  /// angular difference between the central-repo and upwind-paper gradients
+  /// computed from the SAME live φ — kinks in φ behind obstacles / along
+  /// medial axes light up. It doubles as the best available φ-field
+  /// debugging tool.
   /// </summary>
   [ExecuteAlways]
   public class CCFieldVisualizer : MonoBehaviour
@@ -26,10 +33,15 @@ namespace Yohash.ECSContinuumCrowds
       Discomfort,       // g
       Walkable,         // g < 1 mask
       HeightGradient,   // ∇h — arrows
+      Potential,        // φ (per group) — heat ramp, ∞ = black
+      GroupVelocity,    // group velocity field — heading-colored arrows
+      GradientDiff,     // central-repo vs upwind-paper ∇φ angle — shockline debug
     }
 
     [Header("What to draw")]
     public FieldMode mode = FieldMode.Discomfort;
+    [Tooltip("Which group (index into the CCGroup query) for per-group modes.")]
+    [Min(0)] public int groupIndex = 0;
 
     [Header("Window (cells) around this transform")]
     [Min(1)] public int windowRadius = 48;
@@ -54,6 +66,11 @@ namespace Yohash.ECSContinuumCrowds
       if (mode == FieldMode.None) return;
       if (!TryGetFields(out var fields)) return;
 
+      bool needsGroup = mode is FieldMode.Potential or FieldMode.GroupVelocity
+        or FieldMode.GradientDiff;
+      var groupBuffers = default(GroupFieldBuffers);
+      if (needsGroup && !TryGetGroupBuffers(out groupBuffers)) return;
+
       var gi = fields.Indexer;
       var center = (int2)math.floor(
         CCMath.WorldToGrid(transform.position, fields.Origin, fields.CellSize));
@@ -61,7 +78,7 @@ namespace Yohash.ECSContinuumCrowds
       var hi = math.min(center + windowRadius, new int2(gi.W - 1, gi.H - 1));
       if (math.any(lo > hi)) return;
 
-      float rampMax = autoScale ? WindowMax(fields, lo, hi) : fixedMax;
+      float rampMax = autoScale ? WindowMax(fields, groupBuffers, lo, hi) : fixedMax;
       if (rampMax <= 0f) rampMax = 1f;
 
       for (int y = lo.y; y <= hi.y; y++) {
@@ -95,6 +112,30 @@ namespace Yohash.ECSContinuumCrowds
             case FieldMode.HeightGradient:
               DrawArrow(world, fields.DH[i], fields.CellSize);
               break;
+            case FieldMode.Potential: {
+              float phi = groupBuffers.Phi[i];
+              DrawCell(world, fields.CellSize,
+                float.IsInfinity(phi) ? Color.black : Ramp(phi / rampMax));
+              break;
+            }
+            case FieldMode.GroupVelocity:
+              DrawArrow(world, groupBuffers.Velocity0[i], fields.CellSize);
+              break;
+            case FieldMode.GradientDiff: {
+              var cell = new int2(x, y);
+              var central = CCMath.PotentialGradientCentral(groupBuffers.Phi, gi, cell);
+              var upwind = CCMath.PotentialGradientUpwind(groupBuffers.Phi, gi, cell);
+              float lc = math.length(central);
+              float lu = math.length(upwind);
+              if (lc < 1e-6f && lu < 1e-6f) break; // no flow either way
+              if (lc < 1e-6f || lu < 1e-6f) {
+                DrawCell(world, fields.CellSize, Color.magenta); // one-sided flow
+                break;
+              }
+              float angle = math.acos(math.clamp(math.dot(central, upwind), -1f, 1f));
+              DrawCell(world, fields.CellSize, Ramp(angle / math.PI));
+              break;
+            }
           }
         }
       }
@@ -114,7 +155,7 @@ namespace Yohash.ECSContinuumCrowds
       return fields.IsCreated;
     }
 
-    private float WindowMax(in GlobalFields fields, int2 lo, int2 hi)
+    private float WindowMax(in GlobalFields fields, in GroupFieldBuffers group, int2 lo, int2 hi)
     {
       var gi = fields.Indexer;
       float max = 0f;
@@ -124,12 +165,30 @@ namespace Yohash.ECSContinuumCrowds
           float v = mode switch {
             FieldMode.Density => fields.Rho[i],
             FieldMode.Discomfort => fields.Discomfort[i] < 1f ? fields.Discomfort[i] : 0f,
+            FieldMode.Potential when group.IsCreated =>
+              float.IsInfinity(group.Phi[i]) ? 0f : group.Phi[i],
             _ => 0f,
           };
           if (v > max && !float.IsInfinity(v)) max = v;
         }
       }
       return max;
+    }
+
+    private bool TryGetGroupBuffers(out GroupFieldBuffers buffers)
+    {
+      buffers = default;
+      var world = World.DefaultGameObjectInjectionWorld;
+      if (world == null || !world.IsCreated) return false;
+      var em = world.EntityManager;
+      var query = em.CreateEntityQuery(
+        ComponentType.ReadOnly<CCGroup>(),
+        ComponentType.ReadOnly<GroupFieldBuffers>(),
+        ComponentType.ReadOnly<CCGroupInitialized>());
+      using var all = query.ToComponentDataArray<GroupFieldBuffers>(Unity.Collections.Allocator.Temp);
+      if (groupIndex >= all.Length) return false;
+      buffers = all[groupIndex];
+      return buffers.IsCreated;
     }
 
     /// <summary>Heat ramp: 0 → dark blue, ⅓ → cyan, ⅔ → yellow, 1 → red.</summary>

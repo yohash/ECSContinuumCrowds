@@ -13,7 +13,7 @@ namespace Yohash.ECSContinuumCrowds
   /// anisotropic per-cell fields are float4(E, N, W, S) = (+x, +y, −x, −y);
   /// the direction tables below are index-aligned with those components.
   /// </summary>
-  public static class CCMath
+  public static partial class CCMath
   {
     public const int NumDirections = 4;
     public const int DirE = 0; // +x
