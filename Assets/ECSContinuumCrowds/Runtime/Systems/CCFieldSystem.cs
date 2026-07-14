@@ -14,7 +14,7 @@ namespace Yohash.ECSContinuumCrowds
   /// outputs) and run concurrently.
   /// </summary>
   [UpdateInGroup(typeof(CCSimulationSystemGroup))]
-  [UpdateAfter(typeof(CCScatterStampingSystem))]
+  [UpdateAfter(typeof(CCStampingSystem))]
   [BurstCompile]
   public partial struct CCFieldSystem : ISystem
   {

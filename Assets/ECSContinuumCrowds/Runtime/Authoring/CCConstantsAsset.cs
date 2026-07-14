@@ -31,6 +31,9 @@ namespace Yohash.ECSContinuumCrowds
     public float v_scaleMax = 0.3f;
     public float v_scaleMin = 0.25f;
 
+    [Header("Cap (cells) on predictive extrapolation distance (bounds hash bucket size)")]
+    public float v_predictiveDistanceCapCells = 8f;
+
     [Header("Max and Min slopes to scale topographical speed")]
     public float f_slopeMax = 1f;
     public float f_slopeMin = -1f;
@@ -61,6 +64,7 @@ namespace Yohash.ECSContinuumCrowds
         v_predictiveSeconds = v_predictiveSeconds,
         v_scaleMax = v_scaleMax,
         v_scaleMin = v_scaleMin,
+        v_predictiveDistanceCapCells = v_predictiveDistanceCapCells,
         f_slopeMax = f_slopeMax,
         f_slopeMin = f_slopeMin,
         f_rhoMax = f_rhoMax,
